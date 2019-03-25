@@ -34,7 +34,7 @@ def logExcDec(fun, *args, **kwargs):
 
 class Converter:
     def __init__(self, language='pl-PL', intermediateConvert=True,
-                 recogniseNumber=2, converterNumber=2):
+                 recogniseNumber=4, converterNumber=10):
         self.rec = sr.Recognizer()
         self.language = language
         self.loop: asyncio.AbstractEventLoop = asyncio.get_event_loop()
@@ -42,6 +42,8 @@ class Converter:
         self.intermediateConvert = intermediateConvert
         self.recogniseNumber = recogniseNumber
         self.converterNumber = converterNumber
+
+        self.paths = None
 
     async def convert(self):
         queue = asyncio.Queue()
@@ -56,7 +58,7 @@ class Converter:
         localQueue = Queue()
         gen = self.wavFileGenerator()
 
-        with ThreadPoolExecutor(limit, thread_name_prefix='RECOGNISE') as pool:
+        with ThreadPoolExecutor(limit) as pool:
             async for filename in gen:
                 localQueue.put(self.loop.run_in_executor(pool, self.recogniseFile, filename))
                 limit -= 1
@@ -73,10 +75,10 @@ class Converter:
     async def wavFileGenerator(self) -> AsyncIterable[str]:
         if self.intermediateConvert:
             os.makedirs(tmpDir, exist_ok=True)
+            gen = self.paths if self.paths else os.scandir(srcDir)
 
             with ThreadPoolExecutor(10, thread_name_prefix='FILE') as pool:
-                futures = [self.loop.run_in_executor(pool, self._fixWav, file)
-                           for file in os.scandir(srcDir)]
+                futures = [self.loop.run_in_executor(pool, self._fixWav, file) for file in gen]
                 for future in futures:
                     yield await future
         else:
@@ -92,7 +94,6 @@ class Converter:
         program = "ffmpeg -v error -y -i".split()
         program.extend([inputFile, outputFile])
 
-        program = ["cp", inputFile, outputFile]  # TODO change to ffmpeg
         process = subprocess.Popen(program, stdout=subprocess.DEVNULL)
         process.wait()
         return outputFile
@@ -102,14 +103,16 @@ class Converter:
         with sr.AudioFile(filename) as source:
             audio = self.rec.record(source)
 
+        text = None
         try:
             text = self.rec.recognize_google(audio, language=self.language)
         except sr.UnknownValueError:
             logger.error("Cannot understand audio")
-            raise
         except sr.RequestError as e:
             logger.error(e)
-            raise
+
+        if not text:
+            text = os.path.basename(filename)
 
         logger.debug(f"File={filename.split('/')[-1]} has:'{text}'")
         return filename, text
@@ -123,18 +126,33 @@ class Converter:
                 break
 
             oldFilename, decoded = data  # type: str, str
-            if not decoded.endswith('.wav'):
-                decoded += '.wav'
-
-            newPath = os.path.join(targetDir, decoded)
-            os.rename(oldFilename, newPath)
+            os.rename(oldFilename, self.getFileName(decoded))
 
         if self.intermediateConvert:
             os.rmdir(tmpDir)
 
+    @staticmethod
+    def getFileName(fileName) -> str:
+        if not fileName.lower().endswith('.wav'):
+            fileName += '.wav'
+
+        pathTemplate = os.path.join(targetDir, '{}')
+        baseName, ext = os.path.splitext(fileName)
+        newPath = pathTemplate.format(fileName)
+
+        counter = 1
+        while os.path.exists(newPath):
+            newPath = pathTemplate.format(f"{baseName}_{counter}{ext}")
+            counter += 1
+
+        return newPath
+
 
 async def main():
     converter = Converter()
+    import log_conver
+    missing = log_conver.getMissingByReplaced()
+    converter.paths = [p for p in os.scandir(srcDir) if p.name in missing]
     await converter.convert()
 
 
